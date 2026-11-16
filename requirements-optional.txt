@@ -1,0 +1,3 @@
+# Install after torch and build tools, only if using flash_attention_2.
+# python -m pip install -r requirements-optional.txt --no-build-isolation
+flash-attn>=2,<3

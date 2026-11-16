@@ -1,0 +1,30 @@
+{
+  "selected_source": "unexpected_situation",
+  "reference": "A Multimodal In House Reasoning and Planning Pipeline for Self Driving Cars in Unexpected Situations",
+  "files": [
+    {
+      "path": "pipeline_service.py",
+      "original_sha256": "f1d3b166e702c7ea17f46c2e91fc584713056075c76df956ac938ba212512b4d",
+      "copied_sha256": "c4163d0878723801b4feecf82893cf94434227f3c4a650dd601725f376b232e8",
+      "byte_identical": false
+    },
+    {
+      "path": "client.py",
+      "original_sha256": "827d18eff10f1ac69027cda5caa08e4e28fef6a667b60b15925a70afa139100f",
+      "copied_sha256": "827d18eff10f1ac69027cda5caa08e4e28fef6a667b60b15925a70afa139100f",
+      "byte_identical": true
+    },
+    {
+      "path": "system_prompt.py",
+      "original_sha256": "0fd172a34833b51b8d4d06b2e10e7581ad5effeaddec7061b1746d42d0cc1f74",
+      "copied_sha256": "0fd172a34833b51b8d4d06b2e10e7581ad5effeaddec7061b1746d42d0cc1f74",
+      "byte_identical": true
+    },
+    {
+      "path": "planner_agent_prompt.py",
+      "original_sha256": "875465bc47cdc725c358245870fc2e5038d1e9b5a59b19fed8667c0dc6accc98",
+      "copied_sha256": "875465bc47cdc725c358245870fc2e5038d1e9b5a59b19fed8667c0dc6accc98",
+      "byte_identical": true
+    }
+  ]
+}

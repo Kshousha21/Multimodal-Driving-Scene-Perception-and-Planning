@@ -1,0 +1,39 @@
+serve:
+  host: "127.0.0.1"
+  port: 8000
+
+yolo:
+  model_path: "yolo11n.pt"  # Provide locally or allow Ultralytics to download.
+  opts:
+    conf_threshold: 0.25
+    max_det: 200
+    frame_stride: 1         # Required for the paper's no-frame-sampling mode.
+    decode_with_opencv: true
+
+bytetrack:
+  opts:
+    track_high_thresh: 0.5
+    track_low_thresh: 0.1
+    new_track_thresh: 0.6
+    track_buffer: 30
+    match_thresh: 0.8
+    frame_rate: 30
+    fuse_score: true
+
+vision:
+  model: "Qwen/Qwen3-VL-8B-Instruct"
+  system_prompt_path: "system_prompt.py"
+  opts:
+    device_map: "auto"
+    torch_dtype: "bfloat16"
+    attn_implementation: "sdpa"  # Optional flash_attention_2 needs flash-attn.
+    max_new_tokens: 8192
+
+planner:
+  model: "Qwen/Qwen2.5-7B-Instruct"
+  system_prompt_path: "planner_agent_prompt.py"
+  opts:
+    device_map: "auto"
+    torch_dtype: "bfloat16"
+    temperature: 0.1
+    max_new_tokens: 4096
