@@ -10,9 +10,11 @@ The input contained three project variants:
 | `test_project` | Earlier integrated version, alternate fixed service, and model experiment | Excluded as duplicate/earlier experiments |
 | `Unexpected Situation` | Earlier standalone detector/tracker code, planner notebook, prompt archives, dataset, and third-party ByteTrack tree | Excluded from the core package |
 
-The source originals were read only. Four essential Python files were copied;
-both prompts and `client.py` are byte-identical to their selected originals.
-`source-manifest.json` records hashes of the selected originals.
+The source originals were read only. Four essential Python files were copied.
+Both prompts remain byte-identical to their selected originals; the client and
+service now include the fixes described in `verification.md`.
+`source-manifest.json` records historical hashes of the selected originals, not
+checksums of the current working files.
 
 ## Changes in this copy
 

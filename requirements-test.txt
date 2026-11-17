@@ -1,0 +1,7 @@
+# CPU regression tests only: no model downloads, Ray, or PyTorch required.
+numpy>=1.24,<3
+Pillow>=10
+PyYAML>=6
+opencv-python>=4.8,<5
+requests>=2.31
+fastapi>=0.104,<1

@@ -5,6 +5,7 @@ See README.md and docs/known-limitations.md before running the research prototyp
 """
 
 import base64
+import binascii
 import io
 import os
 import sys
@@ -18,7 +19,8 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 from PIL import Image
 import yaml
-from fastapi import Request
+from fastapi import HTTPException, Request
+from fastapi.responses import JSONResponse
 from ray import serve
 from ray.serve.handle import DeploymentHandle
 
@@ -71,6 +73,39 @@ def crop_pil(img: Image.Image, bbox: List[int]) -> Image.Image:
 def ensure_int_box(b):
     return [int(b[0]), int(b[1]), int(b[2]), int(b[3])]
 
+
+def parse_model_json(text: str):
+    """Parse a complete JSON response, allowing an enclosing Markdown fence."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) < 3 or lines[-1].strip() != "```":
+            raise ValueError("Incomplete JSON code fence")
+        text = "\n".join(lines[1:-1])
+    return json.loads(text)
+
+
+def validate_scene_analysis(result):
+    """Check the fields consumed by batching and downstream planning."""
+    if not isinstance(result, dict):
+        raise ValueError("Scene analysis must be a JSON object")
+    if not isinstance(result.get("thoughts"), list) or not result["thoughts"]:
+        raise ValueError("Scene analysis must contain observations")
+    verification = result.get("verification")
+    if not isinstance(verification, dict) or type(verification.get("value")) is not bool:
+        raise ValueError("Scene analysis must contain a boolean verification value")
+    if not isinstance(verification.get("reason"), str):
+        raise ValueError("Scene verification must contain a reason")
+    if type(result.get("isCritical")) is not bool:
+        raise ValueError("Scene isCritical must be a boolean")
+    confidence = result.get("confidence")
+    if type(confidence) not in (int, float) or not 0 <= confidence <= 100:
+        raise ValueError("Scene confidence must be a number from 0 to 100")
+    for field in ("description", "goal"):
+        if not isinstance(result.get(field), str) or not result[field].strip():
+            raise ValueError(f"Scene analysis must contain a non-empty {field}")
+    return result
+
 # =========================
 # YOLO video → per-frame detections
 # =========================
@@ -82,6 +117,8 @@ class YoloVideoWrapper:
         self.conf = float(opts.get("conf_threshold", 0.25))
         self.max_det = int(opts.get("max_det", 200))
         self.frame_stride = int(opts.get("frame_stride", 1))  # process every Nth frame
+        if self.frame_stride < 1:
+            raise ValueError("frame_stride must be at least 1")
 
         # decoding control
         self.decode_with_opencv = bool(opts.get("decode_with_opencv", True))
@@ -89,28 +126,33 @@ class YoloVideoWrapper:
     def _decode_video_with_opencv(self, video_bytes: bytes) -> List[Tuple[int, Image.Image]]:
         import cv2
         # OpenCV doesn't read from bytes directly; write a temp file
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as tmp:
-            tmp.write(video_bytes)
-            tmp.flush()
-            cap = cv2.VideoCapture(tmp.name)
+        # Close the file before OpenCV opens it (required on Windows).
+        with tempfile.TemporaryDirectory() as directory:
+            video_path = Path(directory) / "input.mp4"
+            video_path.write_bytes(video_bytes)
+            cap = cv2.VideoCapture(str(video_path))
             frames = []
             idx = 0
-            ok, frame = cap.read()
-            while ok:
-                if idx % self.frame_stride == 0:
-                    # BGR → RGB PIL
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    pil_img = Image.fromarray(frame_rgb)
-                    frames.append((idx, pil_img))
-                idx += 1
+            try:
+                if not cap.isOpened():
+                    raise ValueError("Video could not be opened")
                 ok, frame = cap.read()
-            cap.release()
+                while ok:
+                    if idx % self.frame_stride == 0:
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        frames.append((idx, Image.fromarray(frame_rgb)))
+                    idx += 1
+                    ok, frame = cap.read()
+            finally:
+                cap.release()
+            if not frames:
+                raise ValueError("Video contains no decodable frames")
         return frames
 
     def _maybe_decode_video(self, video_b64: str) -> List[Tuple[int, Image.Image]]:
         # If model can consume bytes directly, adapt here. Ultralytics model.predict on videos
         # typically expects a path/URI. We'll default to OpenCV decode so we can control stride.
-        video_bytes = base64.b64decode(video_b64)
+        video_bytes = base64.b64decode(video_b64, validate=True)
         if self.decode_with_opencv:
             return self._decode_video_with_opencv(video_bytes)
         # Fallback: still decode via OpenCV because most loaders need paths
@@ -135,12 +177,9 @@ class YoloVideoWrapper:
         frames = self._maybe_decode_video(video_b64)  # list of (idx, PIL)
 
         out_frames: List[Dict[str, Any]] = []
-        from ultralytics.utils.ops import scale_boxes  # used if needed
-
         for idx, pil_img in frames:
-            np_img = np.array(pil_img)  # RGB
             results = self.model.predict(
-                source=np_img,
+                source=pil_img,
                 conf=self.conf,
                 max_det=self.max_det,
                 verbose=False
@@ -180,6 +219,11 @@ class _NaiveMultiTracker:
         self.iou_thresh = iou_thresh
         self.max_age = max_age
 
+    def reset(self):
+        self.next_id = 1
+        self.tracks.clear()
+        self.ages.clear()
+
     @staticmethod
     def _iou(a, b):
         ax1, ay1, ax2, ay2 = a; bx1, by1, bx2, by2 = b
@@ -214,6 +258,8 @@ class _NaiveMultiTracker:
                 # best match existing
                 best_id, best_iou = None, 0.0
                 for tid, tbb in self.tracks.items():
+                    if tid in assigned:
+                        continue
                     i = self._iou(bb, tbb)
                     if i > best_iou:
                         best_iou, best_id = i, tid
@@ -247,7 +293,7 @@ class ByteTrackVideoWrapper:
             # Extract and convert to numpy arrays
             self.conf = np.array([d.get("score", 0.5) for d in dets], dtype=np.float32)
             # xyxy format: [x1, y1, x2, y2]
-            self.xyxy = np.array([d["bbox"] for d in dets], dtype=np.float32)
+            self.xyxy = np.array([d["bbox"] for d in dets], dtype=np.float32).reshape(-1, 4)
             
             # ByteTracker also needs cls (class IDs as integers)
             self.cls = np.zeros(len(dets), dtype=np.int32)
@@ -270,6 +316,8 @@ class ByteTrackVideoWrapper:
                 # Boolean or integer indexing
                 subset = [self.dets[i] for i in np.where(idx)[0]] if idx.dtype == bool else [self.dets[i] for i in idx]
                 return ByteTrackVideoWrapper._DetectionsWrapper(subset)
+            elif isinstance(idx, slice):
+                return ByteTrackVideoWrapper._DetectionsWrapper(self.dets[idx])
             else:
                 return ByteTrackVideoWrapper._DetectionsWrapper([self.dets[idx]])
 
@@ -289,7 +337,8 @@ class ByteTrackVideoWrapper:
                 mot20 = bool(opts.get("mot20", False))
             self.bt = BYTETracker(_Args(), frame_rate=_Args.frame_rate)
             self.use_ultralytics = True
-        except Exception:
+        except ImportError as exc:
+            print(f"[ByteTrack] Backend unavailable; using naive IoU fallback: {exc}", file=sys.stderr)
             self.bt = _NaiveMultiTracker(
                 iou_thresh=float(opts.get("match_thresh", 0.3)),
                 max_age=int(opts.get("track_buffer", 30))
@@ -300,30 +349,24 @@ class ByteTrackVideoWrapper:
         return self._DetectionsWrapper(dets)
 
     def track_sequence(self, frames: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        # Each call is an independent video; no identities may leak between calls.
+        self.bt.reset()
         if not self.use_ultralytics:
             return self.bt.update_sequence(frames)
 
         # Ultralytics BYTETracker: update per frame
         tracked_frames: List[Dict[str, Any]] = []
-        from ultralytics.trackers.byte_tracker import STrack  # for type hints
 
         # NOTE: BYTETracker.update expects a Results-like object with .conf and .xyxy attributes
         # We wrap our detections dict in _DetectionsWrapper to provide this interface
-        im_hw = (1080, 1920)
         print(f"[ByteTrack] Starting tracking with {len(frames)} frames", file=sys.stderr)
         for f in frames:
             dets = f.get("detections", [])
             dets_results = self._to_bytetrack_input(dets)
             
-            # BYTETracker.update returns list of STrack objects with tracking info
-            try:
-                online_targets = self.bt.update(dets_results, im_hw)
-                print(f"[ByteTrack] Frame {f['frame_index']}: {len(dets)} detections -> {len(online_targets)} tracks", file=sys.stderr)
-            except Exception as e:
-                print(f"[ByteTrack] Unexpected error: {type(e).__name__}: {e}", file=sys.stderr)
-                import traceback
-                traceback.print_exc(file=sys.stderr)
-                online_targets = []
+            # The adapter expects the actual BGR image, not a size tuple.
+            image = np.asarray(b64_to_pil(f["frame"]))[:, :, ::-1].copy()
+            online_targets = self.bt.update(dets_results, image)
 
             # build outputs; attach class/crop by nearest IoU from dets
             def iou(a, b):
@@ -381,7 +424,7 @@ class Qwen3VLSequenceWrapper:
         self.processor = AutoProcessor.from_pretrained(model_id_or_path)
         
         # Use flash_attention_2 if available for better performance
-        attn_impl = opts.get("attn_implementation", "flash_attention_2")
+        attn_impl = opts.get("attn_implementation", "sdpa")
         torch_dtype = opts.get("torch_dtype", torch.bfloat16)
         
         try:
@@ -410,7 +453,6 @@ class Qwen3VLSequenceWrapper:
         Get ALL frames from the video sequence - no sampling.
         This leverages Qwen3-VL's 256K context window capability to process entire videos.
         """
-        frames_by_idx = {f["frame_index"]: f for f in tracked_frames}
         pairs = []
         for f in tracked_frames:
             idx = f["frame_index"]
@@ -435,96 +477,47 @@ class Qwen3VLSequenceWrapper:
         return f"Track summary: {summary}."
 
     def _infer_batched(self, all_frames: List[Tuple[int, Image.Image]], tracked_frames: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Process video in batches and merge results - preserves ALL frames"""
-        MAX_FRAMES_PER_BATCH = 50  # Reduced from 100 to help model generate better output
-        num_batches = (len(all_frames) + MAX_FRAMES_PER_BATCH - 1) // MAX_FRAMES_PER_BATCH
-        
-        print(f"[Vision] 📦 Splitting {len(all_frames)} frames into {num_batches} batches", file=sys.stderr)
-        print(f"[Vision] 📦 Splitting {len(all_frames)} frames into {num_batches} batches")  # Also to stdout
-        
-        all_thoughts = []
-        all_critical = False
-        max_confidence = 0
-        descriptions = []
-        goals = []
-        
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * MAX_FRAMES_PER_BATCH
-            end_idx = min((batch_idx + 1) * MAX_FRAMES_PER_BATCH, len(all_frames))
-            batch_frames = all_frames[start_idx:end_idx]
-            
-            frame_range = f"frames {batch_frames[0][0]}-{batch_frames[-1][0]}"
-            print(f"[Vision] Processing batch {batch_idx+1}/{num_batches}: {frame_range} ({len(batch_frames)} frames)", file=sys.stderr)
-            print(f"[Vision] Processing batch {batch_idx+1}/{num_batches}: {frame_range} ({len(batch_frames)} frames)")  # Also to stdout
-            
-            # Process this batch
-            batch_result = self._infer_single_batch(batch_frames, tracked_frames, batch_info=f"Batch {batch_idx+1}/{num_batches}, {frame_range}")
-            
-            print(f"[Vision] Batch {batch_idx+1} result keys: {list(batch_result.keys())}")  # Debug
-            print(f"[Vision] Batch {batch_idx+1} thoughts count: {len(batch_result.get('thoughts', []))}")  # Debug
-            
-            # Merge results
-            all_thoughts.extend(batch_result.get("thoughts", []))
-            if batch_result.get("isCritical"):
-                all_critical = True
-            max_confidence = max(max_confidence, batch_result.get("confidence", 0))
-            descriptions.append(batch_result.get("description", ""))
-            goals.append(batch_result.get("goal", ""))
-        
-        # Combine results
-        return {
-            "qwen3_json": {
-                "thoughts": all_thoughts,
-                "verification": {
-                    "value": True,
-                    "reason": f"All {len(all_frames)} frames analyzed across {num_batches} batches with complete temporal coverage"
-                },
-                "isCritical": all_critical,
-                "confidence": max_confidence,
-                "description": " ".join(descriptions),
-                "goal": goals[0] if goals else "Proceed with caution"
-            }
-        }
+        """Analyze every frame and preserve verification failures across batches."""
+        results = []
+        for start in range(0, len(all_frames), 50):
+            batch_frames = all_frames[start:start + 50]
+            indices = {index for index, _ in batch_frames}
+            batch_tracks = [frame for frame in tracked_frames if frame["frame_index"] in indices]
+            result = self._infer_single_batch(
+                batch_frames, batch_tracks,
+                batch_info=f"frames {batch_frames[0][0]}-{batch_frames[-1][0]}",
+            )
+            results.append(validate_scene_analysis(result))
+        if not results:
+            raise ValueError("No frames to analyze")
+        verified = all(result["verification"]["value"] for result in results)
+        return {"qwen3_json": {
+            "thoughts": [thought for result in results for thought in result["thoughts"]],
+            "verification": {
+                "value": verified,
+                "reason": "; ".join(result["verification"]["reason"] for result in results),
+            },
+            "isCritical": any(result["isCritical"] for result in results),
+            "confidence": max(result["confidence"] for result in results),
+            "description": " ".join(result["description"] for result in results),
+            "goal": results[-1]["goal"],
+        }}
 
     def infer(self, tracked_frames: List[Dict[str, Any]]) -> Dict[str, Any]:
-        # Get ALL frames - no sampling
         all_frames = self._get_all_frames(tracked_frames)
-        
         if not all_frames:
-            return {"description": "No frames to analyze", "thoughts": [], 
-                    "verification": {"value": True, "reason": "No data"}, 
-                    "isCritical": False, "confidence": 0, "goal": "Proceed"}
-        
-        # BATCH PROCESSING: If too many frames, process in chunks and merge
-        MAX_FRAMES_PER_BATCH = 50  # Safe limit per batch
-        
-        if len(all_frames) > MAX_FRAMES_PER_BATCH:
-            print(f"[Vision] Processing {len(all_frames)} frames in batches of {MAX_FRAMES_PER_BATCH}", file=sys.stderr)
+            raise ValueError("No frames to analyze")
+        if len(all_frames) > 50:
             return self._infer_batched(all_frames, tracked_frames)
-        else:
-            # Single batch processing - wrap the result
-            result = self._infer_single_batch(all_frames, tracked_frames)
-            
-            # Debug: check what we got back
-            with open(os.path.join(tempfile.gettempdir(), "qwen3_debug.txt"), "a", encoding="utf-8") as f:
-                f.write(f"\n[Vision infer()] Got result from _infer_single_batch with keys: {list(result.keys())}\n")
-                f.write(f"[Vision infer()] Description: {result.get('description', 'MISSING')[:100]}\n")
-            
-            wrapped = {"qwen3_json": result}
-            with open(os.path.join(tempfile.gettempdir(), "qwen3_debug.txt"), "a", encoding="utf-8") as f:
-                f.write(f"[Vision infer()] Wrapped result keys: {list(wrapped.keys())}\n")
-                f.write(f"[Vision infer()] Wrapped['qwen3_json'] keys: {list(wrapped.get('qwen3_json', {}).keys())}\n")
-            
-            return wrapped
+        result = self._infer_single_batch(all_frames, tracked_frames)
+        return {"qwen3_json": validate_scene_analysis(result)}
 
     def _infer_single_batch(self, all_frames: List[Tuple[int, Image.Image]], tracked_frames: List[Dict[str, Any]], batch_info: str = "") -> Dict[str, Any]:
         """Process a single batch of frames"""
         
         if not all_frames:
-            return {"description": "No frames to analyze", "thoughts": [], 
-                    "verification": {"value": True, "reason": "No data"}, 
-                    "isCritical": False, "confidence": 0, "goal": "Proceed"}
-        
+            raise ValueError("No frames to analyze")
+
         textual_context = self._build_text_context(tracked_frames)
         batch_note = f" ({batch_info})" if batch_info else ""
 
@@ -554,6 +547,7 @@ Output ONLY valid JSON, no markdown, no extra text."""
         
         # Add all frames as images
         for frame_idx, image in all_frames:
+            content.append({"type": "text", "text": f"Frame {frame_idx}"})
             content.append({"type": "image", "image": image})
         
         # Add text prompt after all images
@@ -564,113 +558,28 @@ Output ONLY valid JSON, no markdown, no extra text."""
             "content": content
         }]
         
-        # Process with standard Qwen3-VL processor
-        try:
-            print(f"[Vision] Starting Qwen3-VL inference with {len(all_frames)} frames", file=sys.stderr)
-            print(f"[Vision] First frame size: {all_frames[0][1].size}, mode: {all_frames[0][1].mode}", file=sys.stderr)
-            
-            # Apply chat template and tokenize
-            inputs = self.processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt"
-            )
-            inputs = inputs.to(self.model.device)
-            
-            # Generate response with temperature for more diverse outputs
-            generated_ids = self.model.generate(
-                **inputs, 
-                max_new_tokens=self.max_new_tokens,
-                do_sample=True,
-                temperature=0.2
-            )
-            
-            # Decode only the generated tokens (exclude input prompt)
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            text = self.processor.batch_decode(
-                generated_ids_trimmed, 
-                skip_special_tokens=True, 
-                clean_up_tokenization_spaces=False
-            )[0]
-            
-            print(f"[Vision] Generated text (first 300 chars): {text[:300]}...", file=sys.stderr)
-            
-        except Exception as e:
-            print(f"[Vision] Error in inference: {type(e).__name__}: {str(e)}", file=sys.stderr)
-            print(f"[Vision] ❌ ERROR: {type(e).__name__}: {str(e)}")  # Also print to stdout
-            import traceback
-            traceback.print_exc(file=sys.stderr)
-            traceback.print_exc()  # Also print to stdout
-            # Fallback: simple JSON response
-            text = json.dumps({
-                "thoughts": [],
-                "verification": {"value": False, "reason": "Inference failed"},
-                "isCritical": False,
-                "confidence": 0,
-                "description": "Unable to analyze scene",
-                "goal": "Proceed with caution"
-            })
-
-        # Parse JSON from output
-        qwen_json = {}
-        try:
-            # Debug: write to file since print might not work
-            with open(os.path.join(tempfile.gettempdir(), "qwen3_debug.txt"), "a", encoding="utf-8") as f:
-                f.write(f"\n\n{'='*80}\n")
-                f.write(f"[Vision Debug] Raw model output length: {len(text)} chars\n")
-                f.write(f"[Vision Debug] Raw output:\n{text}\n")
-                f.write(f"{'='*80}\n\n")
-            
-            # Also print
-            print(f"[Vision] Raw model output length: {len(text)} chars")
-            print(f"[Vision] Raw model output (first 500 chars): {text[:500]}")
-            
-            # Try to extract JSON from response
-            import re
-            json_match = re.search(r'\{.*\}', text, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0)
-                print(f"[Vision] Found JSON match, length: {len(json_str)} chars")
-                qwen_json = json.loads(json_str)
-                print(f"[Vision] Successfully parsed JSON with keys: {list(qwen_json.keys())}")
-            else:
-                # If no JSON found, create minimal structure
-                print(f"[Vision] ⚠️  No JSON found in model output!")
-                with open(os.path.join(tempfile.gettempdir(), "qwen3_debug.txt"), "a", encoding="utf-8") as f:
-                    f.write("[Vision Debug] NO JSON FOUND IN OUTPUT!\n")
-                qwen_json = {
-                    "thoughts": [],
-                    "verification": {"value": False, "reason": "No JSON in response"},
-                    "isCritical": False,
-                    "confidence": 0,
-                    "description": text[:200],
-                    "goal": "Proceed safely"
-                }
-        except json.JSONDecodeError as e:
-            print(f"[Vision] JSON parse error: {e}")
-            print(f"[Vision] Failed JSON string (first 500 chars): {json_str[:500] if 'json_str' in locals() else 'N/A'}")
-            qwen_json = {
-                "thoughts": [],
-                "verification": {"value": False, "reason": "JSON parse error"},
-                "isCritical": False,
-                "confidence": 0,
-                "description": text[:200],
-                "goal": "Proceed safely"
-            }
-
-        # Debug: write what we're returning
-        with open(os.path.join(tempfile.gettempdir(), "qwen3_debug.txt"), "a", encoding="utf-8") as f:
-            f.write(f"[Vision Debug] Returning qwen_json with keys: {list(qwen_json.keys())}\n")
-            f.write(f"[Vision Debug] Description length: {len(qwen_json.get('description', ''))} chars\n")
-            f.write(f"[Vision Debug] Thoughts count: {len(qwen_json.get('thoughts', []))}\n")
-            f.write(f"[Vision Debug] Full return value:\n{json.dumps(qwen_json, indent=2)}\n")
-        
-        # Return unwrapped - caller will wrap if needed
-        return qwen_json
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(self.model.device)
+        generated_ids = self.model.generate(
+            **inputs,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=True,
+            temperature=0.2,
+        )
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        text = self.processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0]
+        return validate_scene_analysis(parse_model_json(text))
 
 # =========================
 # Qwen planner
@@ -691,7 +600,7 @@ class QwenPlannerWrapper:
         
         # Load planner agent prompt if provided
         self.planner_agent_prompt = None
-        if planner_agent_prompt_path and os.path.exists(planner_agent_prompt_path):
+        if planner_agent_prompt_path:
             self.planner_agent_prompt = load_system_prompt(planner_agent_prompt_path)
             print(f"[QwenPlanner] Loaded planner agent prompt from {planner_agent_prompt_path}")
 
@@ -702,9 +611,9 @@ class QwenPlannerWrapper:
         else:
             sys_prompt = (
                 "You are a self-driving car planner. "
-                "Using the provided scene description, output a BEHAVIOR TREE in strict JSON. "
-                "Schema keys: {node_type, condition, action, params, children}. "
-                "Return only JSON."
+                "Using the provided scene description, output a JSON array of behavior plan steps. "
+                "Each step must contain id, objective, success_criteria, and nodes_suggested. "
+                "Return only the JSON array."
             )
         
         # Build user message with both description and Qwen3-VL JSON analysis
@@ -735,26 +644,10 @@ class QwenPlannerWrapper:
         
         print(f"[QwenPlanner] Generated response (first 300 chars): {text[:300]}", file=sys.stderr)
 
-        # extract JSON
-        import re
-        m = re.search(r"\{.*\}", text, flags=re.S | re.DOTALL)
-        if m:
-            try:
-                parsed = json.loads(m.group(0))
-                return {"behavior_plan": parsed}
-            except Exception as e:
-                print(f"[QwenPlanner] JSON parse error: {e}", file=sys.stderr)
-        
-        # If JSON extraction failed, look for array format
-        m = re.search(r"\[.*\]", text, flags=re.S | re.DOTALL)
-        if m:
-            try:
-                parsed = json.loads(m.group(0))
-                return {"behavior_plan": parsed}
-            except Exception as e:
-                print(f"[QwenPlanner] Array parse error: {e}", file=sys.stderr)
-        
-        return {"behavior_plan_raw": text}
+        parsed = parse_model_json(text)
+        if not isinstance(parsed, list) or not parsed or not all(isinstance(step, dict) for step in parsed):
+            raise ValueError("Planner response must be a non-empty JSON array of steps")
+        return {"behavior_plan": parsed}
 
 # =========================
 # Ray Serve deployments
@@ -862,7 +755,7 @@ class Ingress:
         "video": "<base64-encoded mp4/mov/avi>",
         "user_prompt": "... (optional)"
       }
-    Response JSON: planner output (behavior tree)
+    Response JSON: detection, tracking, scene analysis, plan steps, and timings.
     """
     def __init__(self,
                  yolo: DeploymentHandle,
@@ -874,12 +767,21 @@ class Ingress:
         self.vision = vision
         self.planner = planner
 
-    async def __call__(self, request: Request) -> Dict[str, Any]:
+    async def __call__(self, request: Request) -> Any:
         try:
             pipeline_start = time.time()
             
-            body = await request.json()
+            try:
+                body = await request.json()
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise HTTPException(status_code=400, detail="Request body must be valid JSON") from exc
+            if not isinstance(body, dict) or not isinstance(body.get("video"), str) or not body["video"]:
+                raise HTTPException(status_code=400, detail="A non-empty base64 video string is required")
             video_b64 = body["video"]
+            try:
+                base64.b64decode(video_b64, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise HTTPException(status_code=400, detail="Invalid base64 video") from exc
             print(f"[Ingress] Received video of size {len(video_b64)} bytes")
 
             # 1) YOLO on all frames
@@ -906,7 +808,9 @@ class Ingress:
             # 4) Qwen planner with Qwen3-VL JSON analysis
             print("[Ingress] Starting Planner (Qwen)...")
             plan_start = time.time()
-            qwen3_json = vis_out.get("qwen3_json", {})
+            qwen3_json = validate_scene_analysis(vis_out.get("qwen3_json"))
+            if not qwen3_json["verification"]["value"]:
+                raise RuntimeError("Scene analysis was not verified; planning stopped")
             plan_out = await self.planner.remote({
                 "description": qwen3_json.get("description", ""),
                 "qwen3_json": qwen3_json
@@ -917,12 +821,12 @@ class Ingress:
             total_time = time.time() - pipeline_start
             
             print(f"\n{'='*80}")
-            print(f"⏱️  PIPELINE TIMING SUMMARY:")
-            print(f"   • YOLO Detection:    {yolo_time:.2f}s ({yolo_time/total_time*100:.1f}%)")
-            print(f"   • ByteTrack:         {bt_time:.2f}s ({bt_time/total_time*100:.1f}%)")
-            print(f"   • Qwen3-VL Vision:   {vis_time:.2f}s ({vis_time/total_time*100:.1f}%)")
-            print(f"   • Qwen Planner:      {plan_time:.2f}s ({plan_time/total_time*100:.1f}%)")
-            print(f"   • TOTAL:             {total_time:.2f}s")
+            print(f"  PIPELINE TIMING SUMMARY:")
+            print(f"    YOLO Detection:    {yolo_time:.2f}s ({yolo_time/total_time*100:.1f}%)")
+            print(f"    ByteTrack:         {bt_time:.2f}s ({bt_time/total_time*100:.1f}%)")
+            print(f"    Qwen3-VL Vision:   {vis_time:.2f}s ({vis_time/total_time*100:.1f}%)")
+            print(f"    Qwen Planner:      {plan_time:.2f}s ({plan_time/total_time*100:.1f}%)")
+            print(f"    TOTAL:             {total_time:.2f}s")
             print(f"{'='*80}\n")
             
             # Return all outputs: YOLO, ByteTrack, Qwen3-VL vision, and Qwen planner
@@ -945,11 +849,14 @@ class Ingress:
                     "total_time": total_time
                 }
             }
+        except HTTPException as exc:
+            # Raw Ray Serve deployments need a Response to set HTTP status codes.
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
         except Exception as e:
             print(f"[Ingress] ERROR: {type(e).__name__}: {e}", file=sys.stderr)
             import traceback
             traceback.print_exc()
-            return {"error": str(e), "type": type(e).__name__}
+            return JSONResponse(status_code=500, content={"error": str(e), "type": type(e).__name__})
 
 
 def main(config_path: str):

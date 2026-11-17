@@ -32,6 +32,8 @@ vehicle controller, and simulator integration are not included.
 | `config.yaml` | Models, prompt paths, detection/tracking options, HTTP settings |
 | `requirements.txt` | Core dependency ranges |
 | `requirements-optional.txt` | Optional FlashAttention dependency |
+| `requirements-test.txt` | CPU test dependencies without the model runtime |
+| `tests/test_pipeline.py` | Regression tests with model and Ray test doubles |
 | `docs/paper-reference.md` | Paper-to-code mapping and reported results |
 | `docs/known-limitations.md` | Findings from source inspection and validation scope |
 | `docs/preparation.md` | Selection decisions, exact changes, and GitHub commands |
@@ -93,6 +95,21 @@ Detection/tracking JSON contains encoded frames/crops and can be large; these
 outputs are ignored by Git. Check the response for errors and read the known
 limitations before interpreting any result. The client's inherited `--prompt`
 argument is currently ignored by the server.
+
+## Tests
+
+Run the CPU regression suite without installing the GPU/model dependencies:
+
+```bash
+python -m pip install -r requirements-test.txt
+python -m unittest discover -s tests -v
+```
+
+The suite exercises real OpenCV video encoding/decoding, tracking logic, model
+response parsing, batch merging, request errors, client output files, and launcher
+wiring. Ray and model inference are replaced with test doubles. Passing these
+tests does not establish model accuracy or a working GPU deployment. See
+[verification](docs/verification.md) for the environment and remaining checks.
 
 ## Reference and status
 

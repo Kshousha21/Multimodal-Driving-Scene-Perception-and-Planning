@@ -12,8 +12,8 @@ The manuscript PDF is not bundled with this source-only package.
 | Section II-B: YOLO11n, confidence 0.25, max 200 detections, stride 1 | `YoloVideoWrapper`, `config.yaml` | All successfully decoded frames are processed at the default stride |
 | Section II-C: ByteTrack | `ByteTrackVideoWrapper` | Uses Ultralytics adapter; inherited IoU fallback is not equivalent to ByteTrack |
 | Section II-D: Qwen3-VL-8B, 50-frame groups | `Qwen3VLSequenceWrapper` | Short videos use one call; longer videos use consecutive groups of 50 |
-| Section II-D: merged results | `_infer_batched` | Concatenates observations/descriptions; criticality OR and maximum confidence; currently selects the first goal rather than the paper's final goal |
-| Section II-E: Qwen2.5-7B planner | `QwenPlannerWrapper`, `planner_agent_prompt.py` | Emits proposed steps and node specifications, with raw-text fallback |
+| Section II-D: merged results | `_infer_batched` | Concatenates observations/descriptions; criticality OR and maximum confidence; selects the final goal and preserves failed verification |
+| Section II-E: Qwen2.5-7B planner | `QwenPlannerWrapper`, `planner_agent_prompt.py` | Emits proposed steps and node specifications; malformed JSON or a non-array response stops processing |
 | Section II-F: distributed orchestration | `YoloService`, `ByteTrackService`, `VisionService`, `PlannerService`, `Ingress` | Separate actors; stages are awaited sequentially for each video |
 | Introduction: executable code generation | No implementation found in selected service | Proposed future integration; no executable BT generator is supplied |
 | Section II-I: quantitative evaluation | No evaluator found in selected core | No claim of reproduced detection/tracking benchmark metrics |

@@ -1,61 +1,58 @@
 # Known limitations and validation scope
 
-This is a curated research snapshot. Packaging and launch portability changes
-are described in `preparation.md`; the inherited model/tracking/merging algorithms
-were not rewritten.
+This is an offline research prototype. CPU regression tests cover application
+logic and video decoding; they do not validate model quality or GPU deployment.
+See [verification](verification.md) for the latest results.
 
-## Findings from code inspection
+## Corrected during the error review
 
-1. The tracker instance persists across requests and is not reset per video.
-   Use a fresh service for independent evaluation videos until this is corrected.
-   Its initialization can silently fall back to an IoU tracker, and update errors
-   are logged and converted to empty tracks. Verify the actual tracking backend.
-2. Tracking uses a fixed 30 FPS config, placeholder class IDs, nearest-IoU class
-   assignment, and a hard-coded image-size tuple in the adapter. The installed
-   Ultralytics API needs an integration check.
-3. The detector passes an RGB NumPy array to Ultralytics. Confirm the expected
-   channel order for the chosen version before measuring detector quality.
-   The default 0.25 detector threshold also removes the 0.1–0.25 range before
-   ByteTrack's low-confidence association stage.
-4. Vision failures return fallback descriptions; inference/parsing failure does
-   not consistently stop downstream planning. In particular, batch merging sets
-   `verification.value` to true even if a batch reports failure. This flag must
-   not be treated as proof of successful analysis or correct hazard recognition.
-5. Batch merging selects `goals[0]`; the paper describes selecting the final
-   batch goal. This discrepancy is retained and explicitly documented.
-6. Track context summarizes ID/class/start/end frames, not detailed bounding-box
-   trajectories. The same whole-video track summary is sent to each batch; prior
-   batch semantic results are not carried into the next inference.
-7. Planner JSON extraction tries an object regex before an array regex. Some
-   multi-step arrays can parse; a single-step array may lose its outer array.
-   There is no strict schema validation and invalid JSON can return raw text.
-8. Empty/undecodable videos and model failures do not consistently use HTTP error
-   status codes. The empty vision path has a different wrapper shape. Inspect
-   output content rather than relying only on a successful HTTP response.
-9. The client's `--prompt` is accepted but not consumed by ingress. GPU fractions
-   are scheduling reservations, not physical-device pinning or VRAM limits.
-10. Input videos and decoded frames/crops are materialized in memory, and response
-    payloads repeat encoded images. Long videos can exhaust RAM/VRAM/context.
-    Supplying every frame does not guarantee every event is recognized.
-11. Temporary video handling uses a named open file and targets Linux behavior.
-    Native Windows GPU deployment has not been validated. Debug output is written
-    to `qwen3_debug.txt` in the system temporary directory.
-12. The supplied descriptor/planner prompts contain strong coverage claims and
-    examples; these are prompt instructions, not validated guarantees. There is
-    no executable BT engine, node implementation generator, simulator, or vehicle
-    control integration in the selected code.
+- Reset tracking state for each video and prevent the naive tracker assigning
+  the same ID to multiple detections in a frame.
+- Supply a real BGR frame to ByteTrack, fix adapter slicing/empty-array shapes,
+  report fallback initialization, and propagate tracking update failures.
+- Pass RGB PIL images directly to YOLO instead of RGB NumPy arrays.
+- Close temporary video files before OpenCV reopens them on Windows, always
+  release the decoder, and reject videos with no decodable frames.
+- Preserve JSON plan arrays, reject malformed model responses, validate the
+  scene fields used downstream, and stop planning on unverified analysis.
+- Preserve failed batch verification and select the final batch goal. Each
+  batch receives only its own track summary and explicit image frame indices.
+- Return HTTP error responses for invalid requests and pipeline failures. The
+  client also detects legacy error objects returned with HTTP 200.
+- Remove emoji console status messages and unconditional debug-file writes.
 
-## Validation performed during preparation
+## Remaining limitations
 
-- Python syntax compilation of all packaged Python files without importing ML models.
-- YAML parsing and resolution of both prompt paths relative to the config file.
-- Prompt imports and non-empty `SYSTEM_PROMPT` values.
-- Dependency declaration syntax and direct-import coverage.
-- Mocked launch check for model/actor bindings, HTTP options, and application shutdown.
-- Git ignore checks for models, datasets, videos, outputs, and credentials.
-- Source provenance checks, bounded text scan, and Git whitespace checks.
+1. The actual Ultralytics, Ray, Transformers, PyTorch, CUDA, and model-weight
+   combination has not been installed or exercised here. Tests use Ray/model
+   doubles. Dependency ranges are not a validated environment lock.
+2. Tracking uses configured 30 FPS rather than source-video FPS, placeholder
+   class IDs, and nearest-IoU class/crop assignment. The naive IoU fallback is
+   not equivalent to ByteTrack. Non-default frame strides change tracking time
+   semantics. Tracking accuracy still requires evaluation with real footage.
+3. The detector's default 0.25 threshold removes the 0.1-0.25 confidence range
+   before ByteTrack's low-confidence association stage.
+4. Track context summarizes ID, class, and start/end frames rather than detailed
+   bounding-box trajectories. Prior batch semantic analysis is not carried into
+   the next model call. A final-batch goal can differ from earlier hazards;
+   criticality and descriptions retain information from all batches.
+5. Scene validation checks the top-level fields consumed by the pipeline, not
+   every nested observation. Planner validation requires a non-empty array of
+   objects but does not validate every plan-step or node field. Valid JSON is
+   not proof of a sensible or feasible plan. The verification flag is model
+   output, not independent verification of scene recognition.
+6. The client's `--prompt` is accepted but is not consumed by ingress. GPU
+   fractions are scheduling reservations, not physical-device pinning or VRAM
+   limits. The default deployments reserve 2 GPUs and 22 CPUs in total.
+7. Videos, decoded frames, and crops are held in memory; response payloads repeat
+   encoded images. Long videos can exhaust RAM, VRAM, or model context. All-frame
+   input coverage does not guarantee recognition of every event.
+8. Native Windows GPU deployment has not been validated. The local test suite
+   verifies video decoding and console compatibility on Windows only.
+9. The supplied prompts contain strong coverage claims and inconsistent planning
+   examples. These are instructions, not measured guarantees. There is no
+   executable behavior-tree engine, node generator, simulator, or vehicle-control
+   integration in this repository.
 
-Ray, PyTorch, CUDA inference, model downloads, dependency installation, tracking
-quality, HTTP inference, and the manuscript's timing/quality claims were **not**
-tested in this Windows preparation environment. No GPU benchmark or accuracy
-claim is implied. Dependency ranges are not a tested environment lock.
+The manuscript's latency and quality claims have not been reproduced. Use a
+provisioned Linux GPU host for model integration tests before evaluating outputs.
